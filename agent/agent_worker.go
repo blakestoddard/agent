@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"expvar"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/buildkite/agent/api"
 	"github.com/buildkite/agent/logger"
+	"github.com/buildkite/agent/metrics"
 	"github.com/buildkite/agent/proctitle"
 	"github.com/buildkite/agent/retry"
 )
@@ -26,6 +26,12 @@ type AgentWorker struct {
 
 	// The configuration of the agent from the CLI
 	AgentConfiguration *AgentConfiguration
+
+	// Metric collection for the agent
+	MetricsCollector *metrics.Collector
+
+	// Metrics scope for the agent
+	metrics *metrics.Scope
 
 	// Whether or not the agent is running
 	running bool
@@ -47,9 +53,6 @@ type AgentWorker struct {
 
 	// Tracks the last successful heartbeat and ping
 	lastPing, lastHeartbeat int64
-
-	// Metrics that the worker exposes
-	heartbeatMetrics, pingMetrics *expvar.Map
 }
 
 // Creates the agent worker and initializes it's API Client
@@ -62,16 +65,22 @@ func (a AgentWorker) Create() AgentWorker {
 	}
 
 	a.APIClient = APIClient{Endpoint: endpoint, Token: a.Agent.AccessToken}.Create()
-
-	// create counters for metrics
-	a.heartbeatMetrics = expvar.NewMap("heartbeats")
-	a.pingMetrics = expvar.NewMap("pings")
-
 	return a
 }
 
 // Starts the agent worker
 func (a *AgentWorker) Start() error {
+	a.metrics = a.MetricsCollector.Scope(metrics.Tags{
+		"hostname":   a.Agent.Hostname,
+		"agent_name": a.Agent.Name,
+	})
+
+	// Start running our metrics collector
+	if err := a.MetricsCollector.Start(); err != nil {
+		return err
+	}
+	defer a.MetricsCollector.Stop()
+
 	// Mark the agent as running
 	a.running = true
 
@@ -89,7 +98,7 @@ func (a *AgentWorker) Start() error {
 				lastHeartbeat := time.Unix(atomic.LoadInt64(&a.lastPing), 0)
 
 				// Track metrics
-				a.heartbeatMetrics.Add("Fail", 1)
+				a.metrics.Count(`agent.heartbeat.error`, 1)
 
 				logger.Error("Failed to heartbeat %s. Will try again in %s. (Last successful was %v ago)",
 					err, heartbeatInterval, time.Now().Sub(lastHeartbeat))
@@ -138,12 +147,13 @@ func (a *AgentWorker) Start() error {
 			continue
 		case <-a.stop:
 			a.ticker.Stop()
+
+			// Mark the agent as not running anymore
+			a.running = false
+
 			return nil
 		}
 	}
-
-	// Mark the agent as not running anymore
-	a.running = false
 
 	return nil
 }
@@ -239,8 +249,7 @@ func (a *AgentWorker) Heartbeat() error {
 	atomic.StoreInt64(&a.lastHeartbeat, time.Now().Unix())
 
 	// Track metrics
-	a.heartbeatMetrics.Add("Total", 1)
-	a.heartbeatMetrics.Add("Success", 1)
+	a.metrics.Count(`agent.heartbeat.success`, 1)
 
 	logger.Debug("Heartbeat sent at %s and received at %s", beat.SentAt, beat.ReceivedAt)
 	return nil
@@ -271,7 +280,7 @@ func (a *AgentWorker) Ping() {
 		}
 
 		// Track metrics
-		a.pingMetrics.Add("Fail", 1)
+		a.metrics.Count(`agent.ping.error`, 1)
 
 		return
 	} else {
@@ -279,8 +288,7 @@ func (a *AgentWorker) Ping() {
 		atomic.StoreInt64(&a.lastPing, time.Now().Unix())
 
 		// Track metrics
-		a.pingMetrics.Add("Total", 1)
-		a.pingMetrics.Add("Success", 1)
+		a.metrics.Count(`agent.ping.success`, 1)
 	}
 
 	// Should we switch endpoints?
@@ -324,6 +332,9 @@ func (a *AgentWorker) Ping() {
 
 	logger.Info("Assigned job %s. Accepting...", ping.Job.ID)
 
+	// Create tags for job metrics
+	jobMetricsScope := a.MetricsCollector.Scope(metrics.Tags{})
+
 	// Accept the job. We'll retry on connection related issues, but if
 	// Buildkite returns a 422 or 500 for example, we'll just bail out,
 	// re-ping, and try the whole process again.
@@ -338,6 +349,7 @@ func (a *AgentWorker) Ping() {
 				logger.Warn("Buildkite rejected the call to accept the job (%s)", err)
 				s.Break()
 			}
+			jobMetricsScope.Count(`jobs.accept.success`, 1)
 		}
 
 		return err
@@ -345,6 +357,7 @@ func (a *AgentWorker) Ping() {
 
 	// If `accepted` is nil, then the job was never accepted
 	if accepted == nil {
+		jobMetricsScope.Count(`jobs.accept.error`, 1)
 		logger.Error("Failed to accept job")
 		return
 	}
@@ -355,6 +368,7 @@ func (a *AgentWorker) Ping() {
 		Agent:              a.Agent,
 		AgentConfiguration: a.AgentConfiguration,
 		Job:                accepted,
+		Metrics:            jobMetricsScope,
 	}.Create()
 
 	// Woo! We've got a job, and successfully accepted it, let's kill our auto-disconnect timer
